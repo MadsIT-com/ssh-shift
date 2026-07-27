@@ -14,7 +14,7 @@ SSHShift is part of the **Shift** suite:
   profile-free RDP launcher for KDE.
 - **SSHShift** — a one-shot graphical launcher for OpenSSH.
 
-The current target is Debian 13 with KDE Plasma and Wayland.
+SSHShift supports Debian 13 with KDE Plasma and Wayland.
 
 ## Why it exists
 
@@ -43,15 +43,21 @@ inside SSHShift.
 
 - No connection profiles, recent-host list, saved usernames, or saved
   passwords.
+- Destination and optional jump-host details have separate cards on the main
+  screen, each pairing its Host and Username fields clearly. Host fields also
+  accept `[username@]hostname[:port]` notation.
 - Authentication is performed directly by OpenSSH in Konsole. SSHShift never
   asks for or handles the password.
 - The hostname, username, jump host, and options are supplied through a private
   OpenSSH configuration under `/run/user/$UID`, not command-line arguments.
 - The private runtime directory is removed when the Konsole session ends.
-- Host-key lookup uses a keyed HMAC of the normalized hostname and port as an
-  opaque `HostKeyAlias`.
+- Persistent host-key lookup uses a keyed HMAC of the normalized hostname and
+  port as an opaque identity.
 - The random HMAC key is held in KDE Wallet.
-- Known-host aliases are additionally stored with OpenSSH's `HashKnownHosts`.
+- The real hostname exists in a private known-hosts file under `/run/user/$UID`
+  only while the session is active, so OpenSSH's prompts remain readable.
+- When the session ends, SSHShift translates the transient hostname back to
+  its opaque identity before updating persistent trust.
 - OpenSSH asks before trusting a host for the first time, silently accepts an
   unchanged key, and refuses a changed key.
 - SSH agent and X11 forwarding are off by default and reset after each launch.
@@ -61,7 +67,7 @@ inside SSHShift.
 The persistent known-host database is stored at
 `$XDG_DATA_HOME/ssh-shift/known_hosts`, normally
 `~/.local/share/ssh-shift/known_hosts`. It contains public host keys indexed by
-salted hashes of KDE-Wallet-keyed opaque aliases—not server names.
+KDE-Wallet-keyed opaque aliases—not server names.
 
 ## Installation on Debian 13
 
@@ -89,18 +95,23 @@ To uninstall the launcher:
 Uninstalling deliberately preserves the known-host database and KDE Wallet key
 so reinstalling does not silently discard host-key-change protection.
 
-## Advanced options
+## Connection options
 
 - **Identity file:** selects one private key for this connection. When empty,
   OpenSSH uses its normal default keys and SSH agent.
-- **Jump host:** routes through a bastion using OpenSSH `ProxyJump`; its identity
-  is protected in the same known-host database.
+- **Jump host:** routes through a bastion using OpenSSH `ProxyJump`; it is on the
+  main screen because bastions are part of many administrators' daily workflow.
+  A separate Jump username field is provided, while `username@host` notation
+  remains supported. Its identity is protected in the same known-host database.
 - **Agent forwarding:** off by default because a privileged user on the remote
   host could use the forwarded agent while the connection is active.
 - **X11 forwarding:** off by default; when enabled, SSHShift requests OpenSSH's
   untrusted X11 mode.
 - **Equivalent command:** shows the ordinary OpenSSH command represented by the
-  selected options.
+  selected options in the Advanced panel.
+
+If Konsole needs time to start, SSHShift displays a cancellable progress window
+instead of appearing unresponsive.
 
 ## Testing
 

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import fcntl
 import hashlib
 import hmac
 import ipaddress
@@ -18,7 +19,7 @@ import sys
 import tempfile
 
 import dbus
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import QEventLoop, QTimer, Qt
 from PyQt6.QtGui import QIcon
 from PyQt6.QtWidgets import (
     QApplication,
@@ -32,6 +33,7 @@ from PyQt6.QtWidgets import (
     QLabel,
     QLineEdit,
     QMessageBox,
+    QProgressDialog,
     QPushButton,
     QToolButton,
     QVBoxLayout,
@@ -40,8 +42,9 @@ from PyQt6.QtWidgets import (
 
 
 TITLE = "SSHShift"
-VERSION = "0.1.0"
+VERSION = "0.5.0"
 SSH = "/usr/bin/ssh"
+SSH_KEYGEN = "/usr/bin/ssh-keygen"
 KONSOLE = "/usr/bin/konsole"
 TARGET_ALIAS = "ssh-shift-target"
 JUMP_ALIAS = "ssh-shift-jump"
@@ -155,6 +158,17 @@ def validate_username(value: str, label: str = "username") -> str:
     return value
 
 
+def parse_destination(value: str) -> tuple[Endpoint, str]:
+    value = value.strip()
+    if "@" not in value:
+        return parse_endpoint(value), ""
+    username, host = value.rsplit("@", 1)
+    username = validate_username(username)
+    if not username:
+        raise SSHShiftError("Enter a username before @ or remove the @ sign.")
+    return parse_endpoint(host), username
+
+
 def display_endpoint(endpoint: Endpoint, username: str = "") -> str:
     host = f"[{endpoint.host}]" if ":" in endpoint.host else endpoint.host
     destination = f"{username}@{host}" if username else host
@@ -189,27 +203,54 @@ class ConnectionDialog(QDialog):
         super().__init__()
         self.setWindowTitle(TITLE)
         self.setWindowIcon(QIcon.fromTheme("utilities-terminal"))
-        self.setMinimumWidth(520)
+        self.setMinimumWidth(600)
 
-        layout = QVBoxLayout(self)
+        self.main_layout = QVBoxLayout(self)
+        self.main_layout.setContentsMargins(20, 18, 20, 16)
+        self.main_layout.setSpacing(0)
         heading = QLabel("<b>Open a secure shell</b>")
         explanation = QLabel(
             "Enter a host and connect with Debian's OpenSSH. Authentication happens "
             "inside Konsole; SSHShift saves no profile, username, or password."
         )
         explanation.setWordWrap(True)
-        layout.addWidget(heading)
-        layout.addWidget(explanation)
+        self.main_layout.addWidget(heading)
+        self.main_layout.addSpacing(10)
+        self.main_layout.addWidget(explanation)
+        self.main_layout.addSpacing(16)
 
-        self.form = QFormLayout()
-        self.form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+        self.destination_group = QGroupBox("Destination")
+        self.destination_form = QFormLayout(self.destination_group)
+        self.destination_form.setFieldGrowthPolicy(
+            QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow
+        )
+        self.destination_form.setHorizontalSpacing(12)
+        self.destination_form.setVerticalSpacing(10)
         self.host = QLineEdit()
-        self.host.setPlaceholderText("Hostname or IP address[:port]")
+        self.host.setPlaceholderText("[username@]hostname or IP address[:port]")
         self.username = QLineEdit()
         self.username.setPlaceholderText("Optional; OpenSSH default when empty")
-        self.form.addRow("&Host:", self.host)
-        self.form.addRow("&Username:", self.username)
-        layout.addLayout(self.form)
+        self.destination_form.addRow("&Host:", self.host)
+        self.destination_form.addRow("&Username:", self.username)
+
+        self.jump_group = QGroupBox("Jump host (optional)")
+        self.jump_form = QFormLayout(self.jump_group)
+        self.jump_form.setFieldGrowthPolicy(
+            QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow
+        )
+        self.jump_form.setHorizontalSpacing(12)
+        self.jump_form.setVerticalSpacing(10)
+        self.jump_host = QLineEdit()
+        self.jump_host.setPlaceholderText("Optional [username@]hostname or IP[:port]")
+        self.jump_username = QLineEdit()
+        self.jump_username.setPlaceholderText("Optional; OpenSSH default when empty")
+        self.jump_form.addRow("H&ost:", self.jump_host)
+        self.jump_form.addRow("User&name:", self.jump_username)
+
+        self.main_layout.addWidget(self.destination_group)
+        self.main_layout.addSpacing(12)
+        self.main_layout.addWidget(self.jump_group)
+        self.main_layout.addSpacing(16)
 
         self.advanced_button = QToolButton()
         self.advanced_button.setText("Advanced options")
@@ -219,7 +260,10 @@ class ConnectionDialog(QDialog):
         )
         self.advanced_button.setArrowType(Qt.ArrowType.RightArrow)
         self.advanced_button.toggled.connect(self._toggle_advanced)
-        layout.addWidget(self.advanced_button, alignment=Qt.AlignmentFlag.AlignLeft)
+        self.main_layout.addWidget(
+            self.advanced_button, alignment=Qt.AlignmentFlag.AlignLeft
+        )
+        self.main_layout.addSpacing(10)
 
         self.advanced_panel = QWidget()
         advanced_layout = QVBoxLayout(self.advanced_panel)
@@ -238,16 +282,6 @@ class ConnectionDialog(QDialog):
         identity_layout.addWidget(self.identity_browse)
         auth_form.addRow("Identity &file:", identity_container)
         advanced_layout.addWidget(auth_group)
-
-        route_group = QGroupBox("Route")
-        route_form = QFormLayout(route_group)
-        self.jump_host = QLineEdit()
-        self.jump_host.setPlaceholderText("Optional hostname or IP address[:port]")
-        self.jump_username = QLineEdit()
-        self.jump_username.setPlaceholderText("Optional")
-        route_form.addRow("&Jump host:", self.jump_host)
-        route_form.addRow("Jump &username:", self.jump_username)
-        advanced_layout.addWidget(route_group)
 
         forwarding_group = QGroupBox("Forwarding")
         forwarding_layout = QVBoxLayout(forwarding_group)
@@ -277,7 +311,9 @@ class ConnectionDialog(QDialog):
         advanced_layout.addWidget(learning_group)
 
         self.advanced_panel.setVisible(False)
-        layout.addWidget(self.advanced_panel)
+        self.main_layout.addWidget(self.advanced_panel)
+        self.main_layout.addStretch(1)
+        self.main_layout.addSpacing(16)
 
         self.buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
@@ -302,7 +338,7 @@ class ConnectionDialog(QDialog):
         self.forward_x11.toggled.connect(self._update_preview)
         self.buttons.accepted.connect(self._validate_and_accept)
         self.buttons.rejected.connect(self.reject)
-        layout.addWidget(self.buttons)
+        self.main_layout.addWidget(self.buttons)
         self.host.setFocus()
         self._update_preview()
 
@@ -324,8 +360,13 @@ class ConnectionDialog(QDialog):
             self.identity_file.setText(path)
 
     def _request(self, check_identity: bool = True) -> ConnectionRequest:
-        endpoint = parse_endpoint(self.host.text())
-        username = validate_username(self.username.text())
+        endpoint, embedded_username = parse_destination(self.host.text())
+        field_username = validate_username(self.username.text())
+        if embedded_username and field_username and embedded_username != field_username:
+            raise SSHShiftError(
+                "The Host and Username fields specify different usernames."
+            )
+        username = field_username or embedded_username
         identity_file = self.identity_file.text().strip()
         if identity_file:
             identity_path = Path(identity_file).expanduser()
@@ -336,12 +377,22 @@ class ConnectionDialog(QDialog):
         jump = None
         jump_username = ""
         if self.jump_host.text().strip():
-            jump = parse_endpoint(self.jump_host.text())
-            jump_username = validate_username(
+            jump, embedded_jump_username = parse_destination(self.jump_host.text())
+            field_jump_username = validate_username(
                 self.jump_username.text(), "jump username"
             )
+            if (
+                embedded_jump_username
+                and field_jump_username
+                and embedded_jump_username != field_jump_username
+            ):
+                raise SSHShiftError(
+                    "The Jump host and Jump username fields specify different "
+                    "usernames."
+                )
+            jump_username = field_jump_username or embedded_jump_username
         elif self.jump_username.text().strip():
-            raise SSHShiftError("Enter a jump host or clear the jump username.")
+            raise SSHShiftError("Enter a Jump host or clear the Jump username.")
 
         return ConnectionRequest(
             endpoint,
@@ -462,6 +513,149 @@ def known_hosts_path() -> Path:
     return known_hosts
 
 
+def known_hosts_lock_path() -> Path:
+    return known_hosts_path().with_name("known_hosts.lock")
+
+
+def known_hosts_token(endpoint: Endpoint) -> str:
+    if endpoint.port == 22:
+        return endpoint.host
+    return f"[{endpoint.host}]:{endpoint.port}"
+
+
+def trust_mappings(
+    request: ConnectionRequest, key: bytes
+) -> list[tuple[str, str]]:
+    endpoints = [request.endpoint]
+    if request.options.jump is not None:
+        endpoints.append(request.options.jump)
+    mappings = []
+    for endpoint in endpoints:
+        mapping = (known_hosts_token(endpoint), opaque_host_alias(key, endpoint))
+        if mapping not in mappings:
+            mappings.append(mapping)
+    return mappings
+
+
+def known_host_field(line: str) -> str:
+    fields = line.split()
+    if not fields:
+        return ""
+    return fields[1] if fields[0].startswith("@") and len(fields) > 1 else fields[0]
+
+
+def replace_known_host_field(line: str, value: str) -> str:
+    fields = line.split(maxsplit=3)
+    if not fields:
+        return line
+    index = 1 if fields[0].startswith("@") else 0
+    if index >= len(fields):
+        raise SSHShiftError("The known-host database contains an invalid entry.")
+    fields[index] = value
+    return " ".join(fields)
+
+
+def find_known_host_lines(path: Path, alias: str) -> list[str]:
+    result = subprocess.run(
+        [SSH_KEYGEN, "-F", alias, "-f", str(path)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+    if result.returncode not in (0, 1):
+        raise SSHShiftError("The known-host database could not be read.")
+    return [
+        line
+        for line in result.stdout.splitlines()
+        if line.strip() and not line.startswith("#")
+    ]
+
+
+def prepare_session_known_hosts(
+    request: ConnectionRequest,
+    key: bytes,
+    directory: Path,
+) -> tuple[Path, list[tuple[str, str]]]:
+    persistent = known_hosts_path()
+    mappings = trust_mappings(request, key)
+    lines: list[str] = []
+    for token, alias in mappings:
+        for line in find_known_host_lines(persistent, alias):
+            translated = replace_known_host_field(line, token)
+            if translated not in lines:
+                lines.append(translated)
+
+    runtime = directory / "known_hosts"
+    runtime.write_text("".join(f"{line}\n" for line in lines), encoding="utf-8")
+    os.chmod(runtime, 0o600)
+    return runtime, mappings
+
+
+def persist_session_known_hosts(
+    runtime: Path,
+    mappings: list[tuple[str, str]],
+) -> None:
+    if not runtime.exists():
+        return
+    try:
+        runtime_lines = [
+            line
+            for line in runtime.read_text(encoding="utf-8").splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        ]
+    except (OSError, UnicodeError) as exc:
+        raise SSHShiftError("The temporary known-host data could not be read.") from exc
+
+    replacements: dict[str, list[str]] = {}
+    for token, alias in mappings:
+        translated = []
+        for line in runtime_lines:
+            if known_host_field(line) == token:
+                opaque = replace_known_host_field(line, alias)
+                if opaque not in translated:
+                    translated.append(opaque)
+        if translated:
+            replacements[alias] = translated
+    if not replacements:
+        return
+
+    persistent = known_hosts_path()
+    lock_path = known_hosts_lock_path()
+    with lock_path.open("a+", encoding="utf-8") as lock:
+        os.chmod(lock_path, 0o600)
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            current = persistent.read_text(encoding="utf-8").splitlines()
+        except (OSError, UnicodeError) as exc:
+            raise SSHShiftError("The known-host database could not be read.") from exc
+
+        matched = {
+            line
+            for alias in replacements
+            for line in find_known_host_lines(persistent, alias)
+        }
+        updated = [line for line in current if line not in matched]
+        for alias in replacements:
+            for line in replacements[alias]:
+                if line not in updated:
+                    updated.append(line)
+
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=".known_hosts.", dir=persistent.parent
+        )
+        temporary = Path(temporary_name)
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as output:
+                output.write("".join(f"{line}\n" for line in updated))
+                output.flush()
+                os.fsync(output.fileno())
+            os.chmod(temporary, 0o600)
+            os.replace(temporary, persistent)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+
 def ssh_config_quote(value: str) -> str:
     if "\0" in value or "\n" in value or "\r" in value:
         raise SSHShiftError("A connection value contains unsupported characters.")
@@ -472,7 +666,6 @@ def host_config_lines(
     alias: str,
     endpoint: Endpoint,
     username: str,
-    host_key_alias: str,
     known_hosts: Path,
     *,
     identity_file: str = "",
@@ -483,9 +676,8 @@ def host_config_lines(
         f"Host {alias}",
         f"    HostName {ssh_config_quote(endpoint.host)}",
         f"    Port {endpoint.port}",
-        f"    HostKeyAlias {host_key_alias}",
         f"    UserKnownHostsFile {ssh_config_quote(str(known_hosts))}",
-        "    HashKnownHosts yes",
+        "    HashKnownHosts no",
         "    StrictHostKeyChecking ask",
         "    CheckHostIP no",
         "    UpdateHostKeys yes",
@@ -511,7 +703,6 @@ def host_config_lines(
 
 def build_ssh_config(
     request: ConnectionRequest,
-    key: bytes,
     known_hosts: Path,
 ) -> str:
     options = request.options
@@ -522,7 +713,6 @@ def build_ssh_config(
                 JUMP_ALIAS,
                 options.jump,
                 options.jump_username,
-                opaque_host_alias(key, options.jump),
                 known_hosts,
             )
         )
@@ -531,7 +721,6 @@ def build_ssh_config(
         TARGET_ALIAS,
         request.endpoint,
         options.username,
-        opaque_host_alias(key, request.endpoint),
         known_hosts,
         identity_file=options.identity_file,
         forward_agent=options.forward_agent,
@@ -578,46 +767,86 @@ def validate_internal_config(path_text: str) -> Path:
     return path
 
 
-def session_main(config_text: str) -> int:
-    config = validate_internal_config(config_text)
-    result = subprocess.run(
-        [SSH, "-F", str(config), TARGET_ALIAS],
-        check=False,
-    )
-    if result.returncode != 0 and sys.stdin.isatty():
-        print(f"\nOpenSSH exited with status {result.returncode}.")
-        try:
-            input("Press Enter to close this window…")
-        except (EOFError, KeyboardInterrupt):
-            pass
-    return result.returncode
-
-
-def start_session(config: Path) -> int:
-    launcher = str(Path(__file__).resolve())
+def start_session(config: Path) -> subprocess.Popen:
+    config = validate_internal_config(str(config))
     try:
-        result = subprocess.run(
+        return subprocess.Popen(
             [
                 KONSOLE,
                 "--separate",
-                "--nofork",
                 "-p",
-                "tabtitle=SSHShift",
+                "LocalTabTitleFormat=SSHShift",
+                "-p",
+                "RemoteTabTitleFormat=SSHShift",
                 "-e",
-                launcher,
-                "--session",
+                SSH,
+                "-F",
                 str(config),
+                TARGET_ALIAS,
             ],
-            check=False,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
         )
     except OSError as exc:
         raise SSHShiftError("Konsole could not be started.") from exc
-    return result.returncode
+
+
+def process_has_child(process: subprocess.Popen) -> bool:
+    try:
+        children = Path(
+            f"/proc/{process.pid}/task/{process.pid}/children"
+        ).read_text(encoding="ascii")
+    except OSError:
+        return False
+    return bool(children.strip())
+
+
+def wait_for_session(process: subprocess.Popen) -> int:
+    """Show feedback until Konsole starts OpenSSH, then wait for the session."""
+    qt_application()
+    progress = QProgressDialog(
+        "Starting Konsole and handing the connection to OpenSSH…\n"
+        "The first Konsole launch can take a little while.",
+        "Cancel",
+        0,
+        0,
+    )
+    progress.setWindowTitle(TITLE)
+    progress.setWindowIcon(QIcon.fromTheme("utilities-terminal"))
+    progress.setWindowModality(Qt.WindowModality.ApplicationModal)
+    progress.setMinimumDuration(0)
+    progress.setAutoClose(False)
+    progress.setAutoReset(False)
+    progress.show()
+
+    loop = QEventLoop()
+    timer = QTimer()
+    timer.setInterval(100)
+
+    def poll() -> None:
+        if progress.wasCanceled():
+            process.terminate()
+            loop.quit()
+        elif process.poll() is not None or process_has_child(process):
+            loop.quit()
+
+    timer.timeout.connect(poll)
+    timer.start()
+    loop.exec()
+    timer.stop()
+    canceled = progress.wasCanceled()
+    progress.close()
+    if canceled:
+        try:
+            return process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            return process.wait()
+    return process.wait()
 
 
 def main() -> int:
-    if len(sys.argv) == 3 and sys.argv[1] == "--session":
-        return session_main(sys.argv[2])
     if sys.argv[1:] in (["--version"], ["-V"]):
         print(f"SSHShift {VERSION}")
         return 0
@@ -634,16 +863,24 @@ def main() -> int:
 
     request = get_connection()
     key = wallet_key()
-    known_hosts = known_hosts_path()
     runtime_directory = private_runtime_directory()
+    runtime_known_hosts: Path | None = None
+    mappings: list[tuple[str, str]] = []
     try:
+        runtime_known_hosts, mappings = prepare_session_known_hosts(
+            request, key, runtime_directory
+        )
         config = write_runtime_config(
             runtime_directory,
-            build_ssh_config(request, key, known_hosts),
+            build_ssh_config(request, runtime_known_hosts),
         )
-        return start_session(config)
+        return wait_for_session(start_session(config))
     finally:
-        shutil.rmtree(runtime_directory, ignore_errors=True)
+        try:
+            if runtime_known_hosts is not None:
+                persist_session_known_hosts(runtime_known_hosts, mappings)
+        finally:
+            shutil.rmtree(runtime_directory, ignore_errors=True)
 
 
 if __name__ == "__main__":
