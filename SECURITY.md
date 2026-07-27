@@ -23,10 +23,16 @@ which is normally tmpfs. Konsole and OpenSSH receive the private configuration
 path plus a fixed alias, so destination names are not placed in their command
 arguments. The directory is removed when the terminal session ends.
 
-The persistent known-host file contains public host keys under an OpenSSH-hashed
-`HostKeyAlias`. That alias is an HMAC of the normalized hostname and port using
-a random secret held in KDE Wallet. This prevents an offline hostname-guessing
-attack against the known-host file alone.
+The persistent known-host file contains public host keys under an opaque HMAC
+of the normalized hostname and port using a random secret held in KDE Wallet.
+This prevents an offline hostname-guessing attack against the known-host file
+alone.
+
+For readable OpenSSH prompts, SSHShift translates matching host keys into a
+mode-0600 known-hosts file inside the private runtime directory. It contains the
+real destination only while the session is active. After Konsole exits, the
+entries are translated back to their opaque identities under an exclusive lock
+and written atomically before the runtime directory is removed.
 
 Host-key trust uses OpenSSH's `StrictHostKeyChecking ask` behavior. A new key
 requires confirmation, an unchanged key connects normally, and a changed key
