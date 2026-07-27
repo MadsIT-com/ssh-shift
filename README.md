@@ -1,6 +1,7 @@
 # SSHShift
 
-**Shift from saved PuTTY sessions to Debian's OpenSSH—without a hard landing.**
+**Shift from Windows key → PuTTY → Enter → host → Enter to Debian's
+OpenSSH—without a hard landing.**
 
 SSHShift is a profile-free KDE launcher for OpenSSH, built for Windows
 administrators moving their daily work to Debian. It provides a familiar
