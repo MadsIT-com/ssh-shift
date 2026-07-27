@@ -58,6 +58,18 @@ class EndpointParsingTests(unittest.TestCase):
             with self.subTest(value=value), self.assertRaises(ssh_shift.SSHShiftError):
                 ssh_shift.validate_username(value)
 
+    def test_username_at_host_destination(self) -> None:
+        endpoint, username = ssh_shift.parse_destination("alice@server.example:2222")
+        self.assertEqual(endpoint, ssh_shift.Endpoint("server.example", 2222))
+        self.assertEqual(username, "alice")
+
+    def test_username_at_bracketed_ipv6_destination(self) -> None:
+        endpoint, username = ssh_shift.parse_destination(
+            "admin@example@[2001:0db8::1]:2222"
+        )
+        self.assertEqual(endpoint, ssh_shift.Endpoint("2001:db8::1", 2222))
+        self.assertEqual(username, "admin@example")
+
 
 class UserInterfaceTests(unittest.TestCase):
     @classmethod
@@ -93,6 +105,23 @@ class UserInterfaceTests(unittest.TestCase):
         request = dialog.values()
         self.assertEqual(request.endpoint, ssh_shift.Endpoint("server.example", 2222))
         self.assertEqual(request.options.jump, ssh_shift.Endpoint("jump.example", 22))
+        dialog.close()
+
+    def test_embedded_username_populates_request(self) -> None:
+        dialog = ssh_shift.ConnectionDialog()
+        dialog.host.setText("alice@server.example")
+        request = dialog.values()
+        self.assertEqual(request.endpoint, ssh_shift.Endpoint("server.example", 22))
+        self.assertEqual(request.options.username, "alice")
+        self.assertEqual(dialog.command_preview.text(), "ssh alice@server.example")
+        dialog.close()
+
+    def test_conflicting_usernames_are_rejected(self) -> None:
+        dialog = ssh_shift.ConnectionDialog()
+        dialog.host.setText("alice@server.example")
+        dialog.username.setText("bob")
+        with self.assertRaises(ssh_shift.SSHShiftError):
+            dialog.values()
         dialog.close()
 
     def test_application_survives_a_discarded_caller_reference(self) -> None:
@@ -173,16 +202,24 @@ class PrivacyConfigurationTests(unittest.TestCase):
         self.assertIn("port 2222", result.stdout)
         self.assertIn("proxyjump ssh-shift-jump", result.stdout)
 
-    @mock.patch.object(ssh_shift.subprocess, "run")
-    def test_konsole_arguments_do_not_contain_destinations(self, run: mock.Mock) -> None:
-        run.return_value.returncode = 0
-        config = Path("/run/user/1000/ssh-shift-test/ssh_config")
-        ssh_shift.start_session(config)
-        arguments = run.call_args.args[0]
-        joined = " ".join(str(argument) for argument in arguments)
-        self.assertNotIn(self.target.host, joined)
-        self.assertNotIn(self.jump.host, joined)
-        self.assertIn("--session", arguments)
+    @mock.patch.object(ssh_shift.subprocess, "Popen")
+    def test_konsole_arguments_do_not_contain_destinations(self, popen: mock.Mock) -> None:
+        process = mock.Mock()
+        popen.return_value = process
+        directory = ssh_shift.private_runtime_directory()
+        try:
+            config = ssh_shift.write_runtime_config(directory, "Host test\n")
+            self.assertIs(ssh_shift.start_session(config), process)
+            arguments = popen.call_args.args[0]
+            joined = " ".join(str(argument) for argument in arguments)
+            self.assertNotIn(self.target.host, joined)
+            self.assertNotIn(self.jump.host, joined)
+            self.assertIn(ssh_shift.SSH, arguments)
+            self.assertIn(ssh_shift.TARGET_ALIAS, arguments)
+        finally:
+            import shutil
+
+            shutil.rmtree(directory, ignore_errors=True)
 
 
 class RuntimeTests(unittest.TestCase):

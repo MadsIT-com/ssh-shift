@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.2.0 - 2026-07-27
+
+- Added `username@host` and `username@host:port` input in the Host field.
+- Rejected conflicting usernames instead of silently choosing one.
+- Launched OpenSSH directly as Konsole's child process.
+- Added visible, cancellable progress while Konsole starts.
+- Removed an invalid Konsole profile-property override that could leave a blank
+  terminal window.
+
 ## 0.1.0 - 2026-07-27
 
 - Added a native Qt 6/KDE one-shot OpenSSH connection dialog.

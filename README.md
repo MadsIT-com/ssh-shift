@@ -43,6 +43,8 @@ inside SSHShift.
 
 - No connection profiles, recent-host list, saved usernames, or saved
   passwords.
+- The Host field accepts both `hostname` and familiar `username@hostname`
+  notation, with an optional `:port`.
 - Authentication is performed directly by OpenSSH in Konsole. SSHShift never
   asks for or handles the password.
 - The hostname, username, jump host, and options are supplied through a private
@@ -101,6 +103,9 @@ so reinstalling does not silently discard host-key-change protection.
   untrusted X11 mode.
 - **Equivalent command:** shows the ordinary OpenSSH command represented by the
   selected options.
+
+If Konsole needs time to start, SSHShift displays a cancellable progress window
+instead of appearing unresponsive.
 
 ## Testing
 

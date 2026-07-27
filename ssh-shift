@@ -18,7 +18,7 @@ import sys
 import tempfile
 
 import dbus
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import QEventLoop, QTimer, Qt
 from PyQt6.QtGui import QIcon
 from PyQt6.QtWidgets import (
     QApplication,
@@ -32,6 +32,7 @@ from PyQt6.QtWidgets import (
     QLabel,
     QLineEdit,
     QMessageBox,
+    QProgressDialog,
     QPushButton,
     QToolButton,
     QVBoxLayout,
@@ -40,7 +41,7 @@ from PyQt6.QtWidgets import (
 
 
 TITLE = "SSHShift"
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 SSH = "/usr/bin/ssh"
 KONSOLE = "/usr/bin/konsole"
 TARGET_ALIAS = "ssh-shift-target"
@@ -155,6 +156,17 @@ def validate_username(value: str, label: str = "username") -> str:
     return value
 
 
+def parse_destination(value: str) -> tuple[Endpoint, str]:
+    value = value.strip()
+    if "@" not in value:
+        return parse_endpoint(value), ""
+    username, host = value.rsplit("@", 1)
+    username = validate_username(username)
+    if not username:
+        raise SSHShiftError("Enter a username before @ or remove the @ sign.")
+    return parse_endpoint(host), username
+
+
 def display_endpoint(endpoint: Endpoint, username: str = "") -> str:
     host = f"[{endpoint.host}]" if ":" in endpoint.host else endpoint.host
     destination = f"{username}@{host}" if username else host
@@ -204,7 +216,7 @@ class ConnectionDialog(QDialog):
         self.form = QFormLayout()
         self.form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
         self.host = QLineEdit()
-        self.host.setPlaceholderText("Hostname or IP address[:port]")
+        self.host.setPlaceholderText("[username@]hostname or IP address[:port]")
         self.username = QLineEdit()
         self.username.setPlaceholderText("Optional; OpenSSH default when empty")
         self.form.addRow("&Host:", self.host)
@@ -324,8 +336,13 @@ class ConnectionDialog(QDialog):
             self.identity_file.setText(path)
 
     def _request(self, check_identity: bool = True) -> ConnectionRequest:
-        endpoint = parse_endpoint(self.host.text())
-        username = validate_username(self.username.text())
+        endpoint, embedded_username = parse_destination(self.host.text())
+        field_username = validate_username(self.username.text())
+        if embedded_username and field_username and embedded_username != field_username:
+            raise SSHShiftError(
+                "The Host and Username fields specify different usernames."
+            )
+        username = field_username or embedded_username
         identity_file = self.identity_file.text().strip()
         if identity_file:
             identity_path = Path(identity_file).expanduser()
@@ -578,46 +595,82 @@ def validate_internal_config(path_text: str) -> Path:
     return path
 
 
-def session_main(config_text: str) -> int:
-    config = validate_internal_config(config_text)
-    result = subprocess.run(
-        [SSH, "-F", str(config), TARGET_ALIAS],
-        check=False,
-    )
-    if result.returncode != 0 and sys.stdin.isatty():
-        print(f"\nOpenSSH exited with status {result.returncode}.")
-        try:
-            input("Press Enter to close this window…")
-        except (EOFError, KeyboardInterrupt):
-            pass
-    return result.returncode
-
-
-def start_session(config: Path) -> int:
-    launcher = str(Path(__file__).resolve())
+def start_session(config: Path) -> subprocess.Popen:
+    config = validate_internal_config(str(config))
     try:
-        result = subprocess.run(
+        return subprocess.Popen(
             [
                 KONSOLE,
                 "--separate",
-                "--nofork",
-                "-p",
-                "tabtitle=SSHShift",
                 "-e",
-                launcher,
-                "--session",
+                SSH,
+                "-F",
                 str(config),
+                TARGET_ALIAS,
             ],
-            check=False,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
         )
     except OSError as exc:
         raise SSHShiftError("Konsole could not be started.") from exc
-    return result.returncode
+
+
+def process_has_child(process: subprocess.Popen) -> bool:
+    try:
+        children = Path(
+            f"/proc/{process.pid}/task/{process.pid}/children"
+        ).read_text(encoding="ascii")
+    except OSError:
+        return False
+    return bool(children.strip())
+
+
+def wait_for_session(process: subprocess.Popen) -> int:
+    """Show feedback until Konsole starts OpenSSH, then wait for the session."""
+    qt_application()
+    progress = QProgressDialog(
+        "Starting Konsole and handing the connection to OpenSSH…\n"
+        "The first Konsole launch can take a little while.",
+        "Cancel",
+        0,
+        0,
+    )
+    progress.setWindowTitle(TITLE)
+    progress.setWindowIcon(QIcon.fromTheme("utilities-terminal"))
+    progress.setWindowModality(Qt.WindowModality.ApplicationModal)
+    progress.setMinimumDuration(0)
+    progress.setAutoClose(False)
+    progress.setAutoReset(False)
+    progress.show()
+
+    loop = QEventLoop()
+    timer = QTimer()
+    timer.setInterval(100)
+
+    def poll() -> None:
+        if progress.wasCanceled():
+            process.terminate()
+            loop.quit()
+        elif process.poll() is not None or process_has_child(process):
+            loop.quit()
+
+    timer.timeout.connect(poll)
+    timer.start()
+    loop.exec()
+    timer.stop()
+    canceled = progress.wasCanceled()
+    progress.close()
+    if canceled:
+        try:
+            return process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            return process.wait()
+    return process.wait()
 
 
 def main() -> int:
-    if len(sys.argv) == 3 and sys.argv[1] == "--session":
-        return session_main(sys.argv[2])
     if sys.argv[1:] in (["--version"], ["-V"]):
         print(f"SSHShift {VERSION}")
         return 0
@@ -641,7 +694,7 @@ def main() -> int:
             runtime_directory,
             build_ssh_config(request, key, known_hosts),
         )
-        return start_session(config)
+        return wait_for_session(start_session(config))
     finally:
         shutil.rmtree(runtime_directory, ignore_errors=True)
 
