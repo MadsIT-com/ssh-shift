@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=SSHShift
+GenericName=Secure Shell Client
+Comment=Connect with OpenSSH without saving profiles or credentials
+Exec=@SSH_SHIFT_EXEC@
+Icon=utilities-terminal
+Terminal=false
+Categories=Network;RemoteAccess;System;
+Keywords=SSH;secure;shell;remote;terminal;PuTTY;
+StartupNotify=true
+StartupWMClass=ssh-shift
+NoDisplay=false

@@ -1,0 +1,654 @@
+#!/usr/bin/python3
+"""Privacy-conscious, profile-free graphical OpenSSH launcher for KDE."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+import hashlib
+import hmac
+import ipaddress
+import os
+from pathlib import Path
+import re
+import secrets
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+
+import dbus
+from PyQt6.QtCore import Qt
+from PyQt6.QtGui import QIcon
+from PyQt6.QtWidgets import (
+    QApplication,
+    QCheckBox,
+    QDialog,
+    QDialogButtonBox,
+    QFileDialog,
+    QFormLayout,
+    QGroupBox,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QMessageBox,
+    QPushButton,
+    QToolButton,
+    QVBoxLayout,
+    QWidget,
+)
+
+
+TITLE = "SSHShift"
+VERSION = "0.1.0"
+SSH = "/usr/bin/ssh"
+KONSOLE = "/usr/bin/konsole"
+TARGET_ALIAS = "ssh-shift-target"
+JUMP_ALIAS = "ssh-shift-jump"
+WALLET_FOLDER = "SSHShift"
+WALLET_ENTRY = "hostname-hmac-key"
+WALLET_APP_ID = "ssh-shift"
+KWALLET_SERVICES = (
+    ("org.kde.kwalletd6", "/modules/kwalletd6"),
+    ("org.kde.kwalletd5", "/modules/kwalletd5"),
+)
+_QT_APPLICATION: QApplication | None = None
+
+
+class SSHShiftError(Exception):
+    pass
+
+
+@dataclass(frozen=True)
+class Endpoint:
+    host: str
+    port: int = 22
+
+    @property
+    def identity(self) -> str:
+        return f"{self.host}\0{self.port}"
+
+
+@dataclass(frozen=True)
+class ConnectionOptions:
+    username: str = ""
+    identity_file: str = ""
+    jump: Endpoint | None = None
+    jump_username: str = ""
+    forward_agent: bool = False
+    forward_x11: bool = False
+
+
+@dataclass(frozen=True)
+class ConnectionRequest:
+    endpoint: Endpoint
+    options: ConnectionOptions
+
+
+def qt_application() -> QApplication:
+    global _QT_APPLICATION
+    application = QApplication.instance()
+    if application is None:
+        application = QApplication([sys.argv[0]])
+        application.setApplicationName(TITLE)
+        application.setApplicationDisplayName(TITLE)
+        application.setDesktopFileName("ssh-shift")
+        application.setWindowIcon(QIcon.fromTheme("utilities-terminal"))
+    assert isinstance(application, QApplication)
+    _QT_APPLICATION = application
+    return application
+
+
+def parse_endpoint(value: str, default_port: int = 22) -> Endpoint:
+    value = value.strip()
+    if not value or len(value) > 253 or any(ch.isspace() for ch in value):
+        raise SSHShiftError("Enter a valid hostname or IP address.")
+
+    port = default_port
+    if value.startswith("["):
+        match = re.fullmatch(r"\[([^\]]+)\](?::([0-9]{1,5}))?", value)
+        if not match:
+            raise SSHShiftError("The bracketed IPv6 address or port is invalid.")
+        try:
+            host = ipaddress.IPv6Address(match.group(1)).compressed
+        except ValueError as exc:
+            raise SSHShiftError("The IPv6 address is invalid.") from exc
+        if match.group(2):
+            port = int(match.group(2))
+    elif value.count(":") > 1:
+        try:
+            host = ipaddress.IPv6Address(value).compressed
+        except ValueError as exc:
+            raise SSHShiftError(
+                "Use [IPv6-address]:port when specifying an IPv6 port."
+            ) from exc
+    else:
+        host_text = value
+        if ":" in value:
+            host_text, port_text = value.rsplit(":", 1)
+            if not port_text.isdecimal():
+                raise SSHShiftError("The port must be a number.")
+            port = int(port_text)
+
+        host = host_text.rstrip(".").lower()
+        if not host:
+            raise SSHShiftError("Enter a valid hostname or IP address.")
+        try:
+            host = str(ipaddress.IPv4Address(host))
+        except ValueError:
+            if not re.fullmatch(r"[a-z0-9_.-]+", host):
+                raise SSHShiftError("The hostname contains unsupported characters.")
+            if any(not label or len(label) > 63 for label in host.split(".")):
+                raise SSHShiftError("The hostname is invalid.")
+
+    if not 1 <= port <= 65535:
+        raise SSHShiftError("The port must be between 1 and 65535.")
+    return Endpoint(host, port)
+
+
+def validate_username(value: str, label: str = "username") -> str:
+    value = value.strip()
+    if not value:
+        return ""
+    if len(value) > 255 or not re.fullmatch(r"[A-Za-z0-9_.@\\-]+", value):
+        raise SSHShiftError(f"The {label} contains unsupported characters.")
+    return value
+
+
+def display_endpoint(endpoint: Endpoint, username: str = "") -> str:
+    host = f"[{endpoint.host}]" if ":" in endpoint.host else endpoint.host
+    destination = f"{username}@{host}" if username else host
+    return destination
+
+
+def equivalent_command(request: ConnectionRequest) -> str:
+    endpoint = request.endpoint
+    options = request.options
+    arguments = ["ssh"]
+    if endpoint.port != 22:
+        arguments.extend(("-p", str(endpoint.port)))
+    if options.identity_file:
+        arguments.extend(("-i", options.identity_file))
+    if options.jump is not None:
+        jump = display_endpoint(options.jump, options.jump_username)
+        if options.jump.port != 22:
+            jump = f"{jump}:{options.jump.port}"
+        arguments.extend(("-J", jump))
+    if options.forward_agent:
+        arguments.append("-A")
+    if options.forward_x11:
+        arguments.append("-X")
+    arguments.append(display_endpoint(endpoint, options.username))
+    return shlex.join(arguments)
+
+
+class ConnectionDialog(QDialog):
+    """A native one-shot connection dialog that deliberately stores no profile."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.setWindowTitle(TITLE)
+        self.setWindowIcon(QIcon.fromTheme("utilities-terminal"))
+        self.setMinimumWidth(520)
+
+        layout = QVBoxLayout(self)
+        heading = QLabel("<b>Open a secure shell</b>")
+        explanation = QLabel(
+            "Enter a host and connect with Debian's OpenSSH. Authentication happens "
+            "inside Konsole; SSHShift saves no profile, username, or password."
+        )
+        explanation.setWordWrap(True)
+        layout.addWidget(heading)
+        layout.addWidget(explanation)
+
+        self.form = QFormLayout()
+        self.form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+        self.host = QLineEdit()
+        self.host.setPlaceholderText("Hostname or IP address[:port]")
+        self.username = QLineEdit()
+        self.username.setPlaceholderText("Optional; OpenSSH default when empty")
+        self.form.addRow("&Host:", self.host)
+        self.form.addRow("&Username:", self.username)
+        layout.addLayout(self.form)
+
+        self.advanced_button = QToolButton()
+        self.advanced_button.setText("Advanced options")
+        self.advanced_button.setCheckable(True)
+        self.advanced_button.setToolButtonStyle(
+            Qt.ToolButtonStyle.ToolButtonTextBesideIcon
+        )
+        self.advanced_button.setArrowType(Qt.ArrowType.RightArrow)
+        self.advanced_button.toggled.connect(self._toggle_advanced)
+        layout.addWidget(self.advanced_button, alignment=Qt.AlignmentFlag.AlignLeft)
+
+        self.advanced_panel = QWidget()
+        advanced_layout = QVBoxLayout(self.advanced_panel)
+        advanced_layout.setContentsMargins(0, 0, 0, 0)
+
+        auth_group = QGroupBox("Authentication")
+        auth_form = QFormLayout(auth_group)
+        identity_container = QWidget()
+        identity_layout = QHBoxLayout(identity_container)
+        identity_layout.setContentsMargins(0, 0, 0, 0)
+        self.identity_file = QLineEdit()
+        self.identity_file.setPlaceholderText("Default keys and SSH agent")
+        self.identity_browse = QPushButton("Browse…")
+        self.identity_browse.clicked.connect(self._browse_identity)
+        identity_layout.addWidget(self.identity_file)
+        identity_layout.addWidget(self.identity_browse)
+        auth_form.addRow("Identity &file:", identity_container)
+        advanced_layout.addWidget(auth_group)
+
+        route_group = QGroupBox("Route")
+        route_form = QFormLayout(route_group)
+        self.jump_host = QLineEdit()
+        self.jump_host.setPlaceholderText("Optional hostname or IP address[:port]")
+        self.jump_username = QLineEdit()
+        self.jump_username.setPlaceholderText("Optional")
+        route_form.addRow("&Jump host:", self.jump_host)
+        route_form.addRow("Jump &username:", self.jump_username)
+        advanced_layout.addWidget(route_group)
+
+        forwarding_group = QGroupBox("Forwarding")
+        forwarding_layout = QVBoxLayout(forwarding_group)
+        self.forward_agent = QCheckBox("Forward SSH authentication agent")
+        self.forward_x11 = QCheckBox("Forward X11 applications (untrusted mode)")
+        forwarding_layout.addWidget(self.forward_agent)
+        forwarding_layout.addWidget(self.forward_x11)
+        forwarding_note = QLabel(
+            "Forwarding is off by default and applies only to this connection. "
+            "Enable agent forwarding only for a host you trust."
+        )
+        forwarding_note.setWordWrap(True)
+        forwarding_layout.addWidget(forwarding_note)
+        advanced_layout.addWidget(forwarding_group)
+
+        learning_group = QGroupBox("Learn the command line")
+        learning_layout = QVBoxLayout(learning_group)
+        learning_note = QLabel(
+            "Equivalent OpenSSH command (shown for learning; SSHShift uses a private "
+            "runtime configuration internally):"
+        )
+        learning_note.setWordWrap(True)
+        self.command_preview = QLineEdit()
+        self.command_preview.setReadOnly(True)
+        learning_layout.addWidget(learning_note)
+        learning_layout.addWidget(self.command_preview)
+        advanced_layout.addWidget(learning_group)
+
+        self.advanced_panel.setVisible(False)
+        layout.addWidget(self.advanced_panel)
+
+        self.buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        connect_button = self.buttons.button(QDialogButtonBox.StandardButton.Ok)
+        assert isinstance(connect_button, QPushButton)
+        connect_button.setText("Connect")
+        connect_button.setIcon(QIcon.fromTheme("network-connect"))
+        connect_button.setEnabled(False)
+        self.host.textChanged.connect(
+            lambda text: connect_button.setEnabled(bool(text.strip()))
+        )
+        for widget in (
+            self.host,
+            self.username,
+            self.identity_file,
+            self.jump_host,
+            self.jump_username,
+        ):
+            widget.textChanged.connect(self._update_preview)
+        self.forward_agent.toggled.connect(self._update_preview)
+        self.forward_x11.toggled.connect(self._update_preview)
+        self.buttons.accepted.connect(self._validate_and_accept)
+        self.buttons.rejected.connect(self.reject)
+        layout.addWidget(self.buttons)
+        self.host.setFocus()
+        self._update_preview()
+
+    def _toggle_advanced(self, expanded: bool) -> None:
+        self.advanced_panel.setVisible(expanded)
+        self.advanced_button.setArrowType(
+            Qt.ArrowType.DownArrow if expanded else Qt.ArrowType.RightArrow
+        )
+        self.adjustSize()
+
+    def _browse_identity(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Choose an SSH identity file",
+            str(Path.home() / ".ssh"),
+            "All files (*)",
+        )
+        if path:
+            self.identity_file.setText(path)
+
+    def _request(self, check_identity: bool = True) -> ConnectionRequest:
+        endpoint = parse_endpoint(self.host.text())
+        username = validate_username(self.username.text())
+        identity_file = self.identity_file.text().strip()
+        if identity_file:
+            identity_path = Path(identity_file).expanduser()
+            if check_identity and not identity_path.is_file():
+                raise SSHShiftError("The selected identity file does not exist.")
+            identity_file = str(identity_path)
+
+        jump = None
+        jump_username = ""
+        if self.jump_host.text().strip():
+            jump = parse_endpoint(self.jump_host.text())
+            jump_username = validate_username(
+                self.jump_username.text(), "jump username"
+            )
+        elif self.jump_username.text().strip():
+            raise SSHShiftError("Enter a jump host or clear the jump username.")
+
+        return ConnectionRequest(
+            endpoint,
+            ConnectionOptions(
+                username=username,
+                identity_file=identity_file,
+                jump=jump,
+                jump_username=jump_username,
+                forward_agent=self.forward_agent.isChecked(),
+                forward_x11=self.forward_x11.isChecked(),
+            ),
+        )
+
+    def _update_preview(self) -> None:
+        try:
+            preview = equivalent_command(self._request(check_identity=False))
+        except SSHShiftError:
+            preview = "Enter a valid host to preview the command."
+        self.command_preview.setText(preview)
+
+    def _validate_and_accept(self) -> None:
+        try:
+            self._request()
+        except SSHShiftError as error:
+            QMessageBox.warning(self, TITLE, str(error))
+            return
+        self.accept()
+
+    def values(self) -> ConnectionRequest:
+        return self._request()
+
+
+def get_connection() -> ConnectionRequest:
+    qt_application()
+    dialog = ConnectionDialog()
+    if dialog.exec() != QDialog.DialogCode.Accepted:
+        raise SystemExit(0)
+    return dialog.values()
+
+
+def show_error(message: str) -> None:
+    qt_application()
+    QMessageBox.critical(None, TITLE, message)
+
+
+def kwallet_interface() -> tuple[dbus.Interface, str]:
+    bus = dbus.SessionBus()
+    last_error: dbus.DBusException | None = None
+    for service, object_path in KWALLET_SERVICES:
+        try:
+            obj = bus.get_object(service, object_path)
+            wallet = dbus.Interface(obj, "org.kde.KWallet")
+            wallet_name = str(wallet.localWallet())
+            if not wallet_name:
+                raise SSHShiftError("KDE Wallet did not report a local wallet.")
+            return wallet, wallet_name
+        except dbus.DBusException as exc:
+            last_error = exc
+    raise SSHShiftError("KDE Wallet is unavailable.") from last_error
+
+
+def wallet_key() -> bytes:
+    try:
+        wallet, wallet_name = kwallet_interface()
+        handle = int(wallet.open(wallet_name, 0, WALLET_APP_ID))
+        if handle < 0:
+            raise SSHShiftError("KDE Wallet could not be opened.")
+        if not wallet.hasFolder(handle, WALLET_FOLDER, WALLET_APP_ID):
+            if not wallet.createFolder(handle, WALLET_FOLDER, WALLET_APP_ID):
+                raise SSHShiftError(
+                    "The SSHShift folder could not be created in KDE Wallet."
+                )
+
+        if wallet.hasEntry(handle, WALLET_FOLDER, WALLET_ENTRY, WALLET_APP_ID):
+            value = str(
+                wallet.readPassword(handle, WALLET_FOLDER, WALLET_ENTRY, WALLET_APP_ID)
+            )
+        else:
+            value = secrets.token_hex(32)
+            result = int(
+                wallet.writePassword(
+                    handle,
+                    WALLET_FOLDER,
+                    WALLET_ENTRY,
+                    value,
+                    WALLET_APP_ID,
+                )
+            )
+            if result != 0:
+                raise SSHShiftError(
+                    "The SSHShift privacy key could not be saved in KDE Wallet."
+                )
+    except dbus.DBusException as exc:
+        raise SSHShiftError("KDE Wallet is unavailable.") from exc
+
+    if not re.fullmatch(r"[0-9a-f]{64}", value):
+        raise SSHShiftError("The SSHShift privacy key in KDE Wallet is invalid.")
+    return bytes.fromhex(value)
+
+
+def opaque_host_alias(key: bytes, endpoint: Endpoint) -> str:
+    digest = hmac.new(
+        key,
+        b"ssh-shift-host-v1\0" + endpoint.identity.encode(),
+        hashlib.sha256,
+    ).hexdigest()
+    return f"ssh-shift-{digest}"
+
+
+def known_hosts_path() -> Path:
+    data_home = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share"))
+    directory = data_home / "ssh-shift"
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(directory, 0o700)
+    known_hosts = directory / "known_hosts"
+    known_hosts.touch(mode=0o600, exist_ok=True)
+    os.chmod(known_hosts, 0o600)
+    return known_hosts
+
+
+def ssh_config_quote(value: str) -> str:
+    if "\0" in value or "\n" in value or "\r" in value:
+        raise SSHShiftError("A connection value contains unsupported characters.")
+    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def host_config_lines(
+    alias: str,
+    endpoint: Endpoint,
+    username: str,
+    host_key_alias: str,
+    known_hosts: Path,
+    *,
+    identity_file: str = "",
+    forward_agent: bool = False,
+    forward_x11: bool = False,
+) -> list[str]:
+    lines = [
+        f"Host {alias}",
+        f"    HostName {ssh_config_quote(endpoint.host)}",
+        f"    Port {endpoint.port}",
+        f"    HostKeyAlias {host_key_alias}",
+        f"    UserKnownHostsFile {ssh_config_quote(str(known_hosts))}",
+        "    HashKnownHosts yes",
+        "    StrictHostKeyChecking ask",
+        "    CheckHostIP no",
+        "    UpdateHostKeys yes",
+        f"    ForwardAgent {'yes' if forward_agent else 'no'}",
+        f"    ForwardX11 {'yes' if forward_x11 else 'no'}",
+        "    ForwardX11Trusted no",
+        "    ExitOnForwardFailure yes",
+        "    AddKeysToAgent no",
+        "    ControlMaster no",
+        "    PermitLocalCommand no",
+    ]
+    if username:
+        lines.append(f"    User {ssh_config_quote(username)}")
+    if identity_file:
+        lines.extend(
+            (
+                f"    IdentityFile {ssh_config_quote(identity_file)}",
+                "    IdentitiesOnly yes",
+            )
+        )
+    return lines
+
+
+def build_ssh_config(
+    request: ConnectionRequest,
+    key: bytes,
+    known_hosts: Path,
+) -> str:
+    options = request.options
+    sections: list[list[str]] = []
+    if options.jump is not None:
+        sections.append(
+            host_config_lines(
+                JUMP_ALIAS,
+                options.jump,
+                options.jump_username,
+                opaque_host_alias(key, options.jump),
+                known_hosts,
+            )
+        )
+
+    target = host_config_lines(
+        TARGET_ALIAS,
+        request.endpoint,
+        options.username,
+        opaque_host_alias(key, request.endpoint),
+        known_hosts,
+        identity_file=options.identity_file,
+        forward_agent=options.forward_agent,
+        forward_x11=options.forward_x11,
+    )
+    if options.jump is not None:
+        target.append(f"    ProxyJump {JUMP_ALIAS}")
+    sections.append(target)
+    return "\n\n".join("\n".join(section) for section in sections) + "\n"
+
+
+def private_runtime_directory() -> Path:
+    runtime_base = Path(f"/run/user/{os.getuid()}")
+    if not runtime_base.is_dir() or runtime_base.stat().st_uid != os.getuid():
+        raise SSHShiftError("The private per-user runtime directory is unavailable.")
+    directory = Path(tempfile.mkdtemp(prefix="ssh-shift-", dir=runtime_base))
+    os.chmod(directory, 0o700)
+    return directory
+
+
+def write_runtime_config(directory: Path, content: str) -> Path:
+    path = directory / "ssh_config"
+    path.write_text(content, encoding="utf-8")
+    os.chmod(path, 0o600)
+    return path
+
+
+def validate_internal_config(path_text: str) -> Path:
+    try:
+        path = Path(path_text).resolve(strict=True)
+    except OSError as exc:
+        raise SSHShiftError("The private SSH configuration is unavailable.") from exc
+    runtime_base = Path(f"/run/user/{os.getuid()}").resolve()
+    if (
+        path.name != "ssh_config"
+        or path.parent.parent != runtime_base
+        or not path.parent.name.startswith("ssh-shift-")
+        or path.stat().st_uid != os.getuid()
+        or path.parent.stat().st_uid != os.getuid()
+        or path.stat().st_mode & 0o077
+        or path.parent.stat().st_mode & 0o077
+    ):
+        raise SSHShiftError("The private SSH configuration failed its safety check.")
+    return path
+
+
+def session_main(config_text: str) -> int:
+    config = validate_internal_config(config_text)
+    result = subprocess.run(
+        [SSH, "-F", str(config), TARGET_ALIAS],
+        check=False,
+    )
+    if result.returncode != 0 and sys.stdin.isatty():
+        print(f"\nOpenSSH exited with status {result.returncode}.")
+        try:
+            input("Press Enter to close this window…")
+        except (EOFError, KeyboardInterrupt):
+            pass
+    return result.returncode
+
+
+def start_session(config: Path) -> int:
+    launcher = str(Path(__file__).resolve())
+    try:
+        result = subprocess.run(
+            [
+                KONSOLE,
+                "--separate",
+                "--nofork",
+                "-p",
+                "tabtitle=SSHShift",
+                "-e",
+                launcher,
+                "--session",
+                str(config),
+            ],
+            check=False,
+        )
+    except OSError as exc:
+        raise SSHShiftError("Konsole could not be started.") from exc
+    return result.returncode
+
+
+def main() -> int:
+    if len(sys.argv) == 3 and sys.argv[1] == "--session":
+        return session_main(sys.argv[2])
+    if sys.argv[1:] in (["--version"], ["-V"]):
+        print(f"SSHShift {VERSION}")
+        return 0
+    if sys.argv[1:] in (["--help"], ["-h"]):
+        print("usage: ssh-shift [--help] [--version]")
+        return 0
+    if len(sys.argv) > 1:
+        print("ssh-shift: unexpected command-line arguments", file=sys.stderr)
+        return 2
+    if not Path(SSH).is_file():
+        raise SSHShiftError("OpenSSH client is not installed.")
+    if not Path(KONSOLE).is_file():
+        raise SSHShiftError("Konsole is not installed.")
+
+    request = get_connection()
+    key = wallet_key()
+    known_hosts = known_hosts_path()
+    runtime_directory = private_runtime_directory()
+    try:
+        config = write_runtime_config(
+            runtime_directory,
+            build_ssh_config(request, key, known_hosts),
+        )
+        return start_session(config)
+    finally:
+        shutil.rmtree(runtime_directory, ignore_errors=True)
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except SSHShiftError as error:
+        show_error(str(error))
+        raise SystemExit(1) from None
