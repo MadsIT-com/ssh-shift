@@ -27,6 +27,18 @@ The Advanced options panel shows the equivalent `ssh` command for the current
 choices. The launcher can therefore act as training wheels: use the graphical
 workflow today and take the same command to a terminal whenever you are ready.
 
+## Updates stay with Debian
+
+SSHShift does not bundle its own SSH implementation. It launches the OpenSSH
+and Konsole packages maintained by Debian, so normal `apt` upgrades deliver
+their security and bug fixes through the same trusted update path as the rest
+of the system. There is no separate full client, private protocol copy, or
+extra updater that can quietly fall behind.
+
+The small wrapper may occasionally need a compatibility or interface update,
+but the security-sensitive SSH engine remains Debian's package—not frozen
+inside SSHShift.
+
 ## Behavior and privacy
 
 - No connection profiles, recent-host list, saved usernames, or saved
