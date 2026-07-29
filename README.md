@@ -8,11 +8,15 @@ administrators moving their daily work to Debian. It provides a familiar
 “enter a host and connect” window, then gets out of the way and lets the
 system's real `ssh` client run inside Konsole.
 
-SSHShift is part of the **Shift** suite:
+## The Shift suite
 
-- [RDPShift](https://github.com/MadsIT-com/rdp-shift) — an `mstsc`-style,
-  profile-free RDP launcher for KDE.
-- **SSHShift** — a one-shot graphical launcher for OpenSSH.
+| Tool | Familiar starting point | Debian engine |
+| --- | --- | --- |
+| [RDPShift](https://github.com/MadsIT-com/rdp-shift) | An `mstsc`-style “enter a computer and connect” workflow | [FreeRDP](https://www.freerdp.com/) |
+| [SSHShift](https://github.com/MadsIT-com/ssh-shift) | `Windows key → PuTTY → Enter → host → Enter`, made native to KDE | [OpenSSH](https://www.openssh.com/) + Konsole |
+| [MapShift](https://github.com/MadsIT-com/map-shift) | A familiar “map network drive” path into KDE applications | KDE KIO SMB + KIO-FUSE |
+| [ServiceShift](https://github.com/MadsIT-com/service-shift) | A `services.msc`-style overview with familiar service controls | systemd + PolicyKit |
+| [TaskShift](https://github.com/MadsIT-com/task-shift) | A Task Scheduler-style overview with safe schedule editing | systemd timers + PolicyKit |
 
 SSHShift supports Debian 13 with KDE Plasma and Wayland.
 
